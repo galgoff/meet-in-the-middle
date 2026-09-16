@@ -1,2 +1,7 @@
 venv/
 .env
+__pycache__/
+geocode_cache.json
+trip.db
+geocode_cache.json
+__pycache__/

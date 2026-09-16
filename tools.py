@@ -16,6 +16,41 @@ from datetime import datetime
 _CACHE_PATH = "geocode_cache.json"
 _tf = TimezoneFinder()
 
+NOMINATIM_RATE_LIMIT_SLEEP_SECONDS = 1.0  # required by Nominatim's usage policy, not tunable
+
+# Lightweight call-level metrics — enough to answer "where did the time
+# go" without guessing, not a full tracing system (that's Week 5's job:
+# per-call input/output/latency logging for auditability). A cold cache
+# means every candidate city pays NOMINATIM_RATE_LIMIT_SLEEP_SECONDS on
+# top of the actual request — with ~30 candidate cities, that's 30+
+# seconds of *mandatory* sleep alone before any real work happens. These
+# counters make that visible instead of just feeling slow.
+_stats = {
+    "cache_hits": 0,
+    "cache_misses": 0,
+    "network_seconds": 0.0,
+    "sleep_seconds": 0.0,
+}
+
+
+def reset_geocode_stats() -> None:
+    """Zero the metrics. Call at the start of a run to scope the numbers
+    to just that run instead of accumulating across calls."""
+    _stats["cache_hits"] = 0
+    _stats["cache_misses"] = 0
+    _stats["network_seconds"] = 0.0
+    _stats["sleep_seconds"] = 0.0
+
+
+def get_geocode_stats() -> dict:
+    """Snapshot of geocode_city's time spending this run: cache hits
+    vs. misses, total time actually waiting on Nominatim's network
+    response, and total time spent in its mandatory per-call rate-limit
+    sleep (see NOMINATIM_RATE_LIMIT_SLEEP_SECONDS) — by policy, not a
+    bug, but easy to mistake for one when a cold cache means dozens of
+    calls back to back."""
+    return dict(_stats)
+
 
 def _load_cache() -> dict:
     if os.path.exists(_CACHE_PATH):
@@ -41,8 +76,11 @@ def geocode_city(city: str) -> dict:
     key = city.lower()
     cache = _load_cache()
     if key in cache:
+        _stats["cache_hits"] += 1
         return cache[key]
 
+    _stats["cache_misses"] += 1
+    _request_start = time.perf_counter()
     try:
         response = requests.get(
             "https://nominatim.openstreetmap.org/search",
@@ -55,7 +93,9 @@ def geocode_city(city: str) -> dict:
     except requests.exceptions.RequestException as e:
         return {"error": f"Network error looking up '{city}': {e}"}
     finally:
-        time.sleep(1)  # respect Nominatim's usage policy
+        _stats["network_seconds"] += time.perf_counter() - _request_start
+        time.sleep(NOMINATIM_RATE_LIMIT_SLEEP_SECONDS)  # respect Nominatim's usage policy
+        _stats["sleep_seconds"] += NOMINATIM_RATE_LIMIT_SLEEP_SECONDS
 
     if not results:
         return {"error": f"No match found for '{city}'."}
@@ -73,6 +113,11 @@ def geocode_city(city: str) -> dict:
         "lon": float(top["lon"]),
         "display_name": top["display_name"],
         "ambiguous": ambiguous,
+        # Country of the top match — used by ground_travel.py to check
+        # whether ground travel is even on the table (island nations,
+        # closed borders). Blank if Nominatim didn't return one; callers
+        # treat that as "unknown, not ruled out" rather than an error.
+        "country": top.get("address", {}).get("country", ""),
     }
     if ambiguous:
         result["alternatives"] = [
